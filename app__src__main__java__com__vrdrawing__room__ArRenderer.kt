@@ -6,6 +6,10 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
@@ -17,6 +21,7 @@ import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
+import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -45,6 +50,23 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     @Volatile var tracking = false
     @Volatile var hasImage = false
     @Volatile var placed = false
+
+    // Stable mode: the camera is only a background. Head rotation comes from the gyroscope.
+    @Volatile var stableMode = false
+    @Volatile var gyroAvailable = true
+    @Volatile private var gyroReady = false
+    private val rotLock = Any()
+    private val rotRaw = FloatArray(9)
+    private val rotA = FloatArray(9)
+    private val rotB = FloatArray(9)
+    private val rotTmp = FloatArray(9)
+    private var stablePlaced = false
+    private val stableAnchor = FloatArray(16)
+    private val anchorM = FloatArray(16)
+    private val camC = FloatArray(3)
+    private val camX = floatArrayOf(1f, 0f, 0f)
+    private val camY = floatArrayOf(0f, 1f, 0f)
+    private val camZ = floatArrayOf(0f, 0f, 1f)
 
     // The pointer dot and the buttons around the image can be hidden (locked)
     @Volatile var uiLocked = false
@@ -82,6 +104,7 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     private var grabAlpha = 1f
     private var grabOffZ = 0f
     private var grabFy = 0f
+    private val grabCam = FloatArray(3)
 
     private val quadArr = floatArrayOf(-1f, -1f, -1f, 1f, 1f, -1f, 1f, 1f)
     private val uvArr = floatArrayOf(0f, 1f, 0f, 0f, 1f, 1f, 1f, 0f)
@@ -120,6 +143,42 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
 
     fun setPress(down: Boolean) {
         pressDown = down
+    }
+
+    fun setStable(on: Boolean) {
+        stableMode = on
+        requestPlace()
+    }
+
+    private val sensorListener = object : SensorEventListener {
+        override fun onSensorChanged(event: SensorEvent) {
+            try {
+                SensorManager.getRotationMatrixFromVector(rotTmp, event.values)
+                synchronized(rotLock) {
+                    System.arraycopy(rotTmp, 0, rotRaw, 0, 9)
+                }
+                gyroReady = true
+            } catch (e: Exception) {
+            }
+        }
+
+        override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+    }
+
+    fun startSensors(sm: SensorManager) {
+        val sensor = sm.getDefaultSensor(Sensor.TYPE_GAME_ROTATION_VECTOR)
+            ?: sm.getDefaultSensor(Sensor.TYPE_ROTATION_VECTOR)
+        if (sensor == null) {
+            gyroAvailable = false
+        } else {
+            gyroAvailable = true
+            sm.registerListener(sensorListener, sensor, SensorManager.SENSOR_DELAY_GAME)
+        }
+    }
+
+    fun stopSensors(sm: SensorManager) {
+        sm.unregisterListener(sensorListener)
+        gyroReady = false
     }
 
     fun fade(delta: Float) {
@@ -198,26 +257,42 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
             uvBuf.position(0)
         }
 
-        val isTracking = camera.trackingState == TrackingState.TRACKING
-        tracking = isTracking
+        val viewW = if (vrMode) width / 2 else width
+        try {
+            camera.getProjectionMatrix(proj, 0, 0.05f, 100f)
+        } catch (e: Exception) {
+            Matrix.perspectiveM(proj, 0, 60f, viewW.toFloat() / height.toFloat(), 0.05f, 100f)
+        }
+
+        if (stableMode) {
+            tracking = updateGyroCamera()
+        } else {
+            tracking = camera.trackingState == TrackingState.TRACKING
+            val dp = camera.displayOrientedPose
+            System.arraycopy(dp.translation, 0, camC, 0, 3)
+            System.arraycopy(dp.xAxis, 0, camX, 0, 3)
+            System.arraycopy(dp.yAxis, 0, camY, 0, 3)
+            System.arraycopy(dp.zAxis, 0, camZ, 0, 3)
+            camera.getViewMatrix(view, 0)
+        }
 
         val bmp = pending.getAndSet(null)
         if (bmp != null) uploadImage(bmp)
 
-        if (placePending && imgTex != 0 && isTracking) {
-            if (placeInFront(s, camera)) placePending = false
+        if (placePending && imgTex != 0 && tracking) {
+            val ok = if (stableMode) placeStable() else placeInFront(s, camera)
+            if (ok) placePending = false
         }
 
-        camera.getProjectionMatrix(proj, 0, 0.05f, 100f)
-        camera.getViewMatrix(view, 0)
-
         val a = anchor
-        val showImage = isTracking && imgTex != 0 && a != null && a.trackingState == TrackingState.TRACKING
+        val showImage = tracking && imgTex != 0 &&
+            (if (stableMode) stablePlaced else (a != null && a.trackingState == TrackingState.TRACKING))
 
         if (showImage) {
-            updateBase(a!!)
-            updateInteraction(camera)
-            updateBase(a)
+            loadAnchorMatrix(a)
+            updateBase()
+            updateInteraction()
+            updateBase()
         } else {
             hovered = H_NONE
             active = H_NONE
@@ -235,8 +310,111 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         }
     }
 
-    private fun updateBase(a: Anchor) {
-        a.pose.toMatrix(base, 0)
+    /** Camera orientation from the gyroscope. The camera stays at the center of the room. */
+    private fun updateGyroCamera(): Boolean {
+        if (!gyroReady) return false
+        synchronized(rotLock) {
+            System.arraycopy(rotRaw, 0, rotA, 0, 9)
+        }
+        val axisX: Int
+        val axisY: Int
+        when (activity.displayRotation()) {
+            Surface.ROTATION_90 -> {
+                axisX = SensorManager.AXIS_Y
+                axisY = SensorManager.AXIS_MINUS_X
+            }
+            Surface.ROTATION_180 -> {
+                axisX = SensorManager.AXIS_MINUS_X
+                axisY = SensorManager.AXIS_MINUS_Y
+            }
+            Surface.ROTATION_270 -> {
+                axisX = SensorManager.AXIS_MINUS_Y
+                axisY = SensorManager.AXIS_X
+            }
+            else -> {
+                axisX = SensorManager.AXIS_X
+                axisY = SensorManager.AXIS_Y
+            }
+        }
+        if (!SensorManager.remapCoordinateSystem(rotA, axisX, axisY, rotB)) return false
+
+        // Screen axes, converted from the sensor world (East, North, Up) to our world (X, Y up, Z)
+        camX[0] = rotB[0]
+        camX[1] = rotB[6]
+        camX[2] = -rotB[3]
+        camY[0] = rotB[1]
+        camY[1] = rotB[7]
+        camY[2] = -rotB[4]
+        camZ[0] = rotB[2]
+        camZ[1] = rotB[8]
+        camZ[2] = -rotB[5]
+        camC[0] = 0f
+        camC[1] = 0f
+        camC[2] = 0f
+
+        view[0] = camX[0]
+        view[1] = camY[0]
+        view[2] = camZ[0]
+        view[3] = 0f
+        view[4] = camX[1]
+        view[5] = camY[1]
+        view[6] = camZ[1]
+        view[7] = 0f
+        view[8] = camX[2]
+        view[9] = camY[2]
+        view[10] = camZ[2]
+        view[11] = 0f
+        view[12] = 0f
+        view[13] = 0f
+        view[14] = 0f
+        view[15] = 1f
+        return true
+    }
+
+    private fun placeStable(): Boolean {
+        val fx0 = -camZ[0]
+        val fz0 = -camZ[2]
+        val hl = sqrt(fx0 * fx0 + fz0 * fz0)
+        val z: FloatArray
+        val pos: FloatArray
+        if (hl < 1e-3f) {
+            z = floatArrayOf(0f, 0f, 1f)
+            pos = floatArrayOf(0f, 0f, -DEFAULT_DISTANCE)
+        } else {
+            val fx = fx0 / hl
+            val fz = fz0 / hl
+            z = floatArrayOf(-fx, 0f, -fz)
+            pos = floatArrayOf(fx * DEFAULT_DISTANCE, 0f, fz * DEFAULT_DISTANCE)
+        }
+        Matrix.setIdentityM(stableAnchor, 0)
+        // columns: x axis, y axis, z axis, position
+        stableAnchor[0] = z[2]
+        stableAnchor[1] = 0f
+        stableAnchor[2] = -z[0]
+        stableAnchor[4] = 0f
+        stableAnchor[5] = 1f
+        stableAnchor[6] = 0f
+        stableAnchor[8] = z[0]
+        stableAnchor[9] = z[1]
+        stableAnchor[10] = z[2]
+        stableAnchor[12] = pos[0]
+        stableAnchor[13] = pos[1]
+        stableAnchor[14] = pos[2]
+        stablePlaced = true
+        placed = true
+        return true
+    }
+
+    private fun loadAnchorMatrix(a: Anchor?) {
+        if (stableMode) {
+            System.arraycopy(stableAnchor, 0, anchorM, 0, 16)
+        } else if (a != null) {
+            a.pose.toMatrix(anchorM, 0)
+        }
+    }
+
+    private fun updateBase() {
+        System.arraycopy(anchorM, 0, base, 0, 16)
         Matrix.translateM(base, 0, offX, offY, offZ)
     }
 
@@ -259,13 +437,10 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     private fun handleSize(id: Int): Float = if (id == H_MOVE) 0.15f else 0.11f
 
     /** Finds where the center-of-screen ray crosses the plane of the image. */
-    private fun computeGaze(camera: Camera): Boolean {
-        val dp = camera.displayOrientedPose
-        val c = dp.translation
-        val zc = dp.zAxis
-        val fx = -zc[0]
-        val fy = -zc[1]
-        val fz = -zc[2]
+    private fun computeGaze(): Boolean {
+        val fx = -camZ[0]
+        val fy = -camZ[1]
+        val fz = -camZ[2]
         gazeFy = fy
         val nx = base[8]
         val ny = base[9]
@@ -275,18 +450,18 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         val ox = base[12]
         val oy = base[13]
         val oz = base[14]
-        val t = ((ox - c[0]) * nx + (oy - c[1]) * ny + (oz - c[2]) * nz) / denom
+        val t = ((ox - camC[0]) * nx + (oy - camC[1]) * ny + (oz - camC[2]) * nz) / denom
         if (t <= 0f) return false
-        val ix = c[0] + fx * t - ox
-        val iy = c[1] + fy * t - oy
-        val iz = c[2] + fz * t - oz
+        val ix = camC[0] + fx * t - ox
+        val iy = camC[1] + fy * t - oy
+        val iz = camC[2] + fz * t - oz
         gazeX = ix * base[0] + iy * base[1] + iz * base[2]
         gazeY = ix * base[4] + iy * base[5] + iz * base[6]
         return true
     }
 
-    private fun updateInteraction(camera: Camera) {
-        gazeOk = computeGaze(camera)
+    private fun updateInteraction() {
+        gazeOk = computeGaze()
         if (uiLocked) {
             hovered = H_NONE
             active = H_NONE
@@ -317,15 +492,33 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
             grabAlpha = alpha
             grabOffZ = offZ
             grabFy = gazeFy
+            if (active == H_MOVE) {
+                // Remember where the image is relative to the phone
+                val rx = base[12] - camC[0]
+                val ry = base[13] - camC[1]
+                val rz = base[14] - camC[2]
+                grabCam[0] = rx * camX[0] + ry * camX[1] + rz * camX[2]
+                grabCam[1] = rx * camY[0] + ry * camY[1] + rz * camY[2]
+                grabCam[2] = rx * camZ[0] + ry * camZ[1] + rz * camZ[2]
+            }
         }
         if (!down) active = H_NONE
         prevPress = down
 
         if (active != H_NONE) {
             when (active) {
-                H_MOVE -> if (gazeOk) {
-                    offX += gazeX - grabX
-                    offY += gazeY - grabY
+                H_MOVE -> {
+                    // Hold the image like a physical object: it keeps its distance and
+                    // direction relative to the phone and follows every movement.
+                    val tx = camC[0] + camX[0] * grabCam[0] + camY[0] * grabCam[1] + camZ[0] * grabCam[2]
+                    val ty = camC[1] + camX[1] * grabCam[0] + camY[1] * grabCam[1] + camZ[1] * grabCam[2]
+                    val tz = camC[2] + camX[2] * grabCam[0] + camY[2] * grabCam[1] + camZ[2] * grabCam[2]
+                    val dx = tx - anchorM[12]
+                    val dy = ty - anchorM[13]
+                    val dz = tz - anchorM[14]
+                    offX = (dx * anchorM[0] + dy * anchorM[1] + dz * anchorM[2]).coerceIn(-8f, 8f)
+                    offY = (dx * anchorM[4] + dy * anchorM[5] + dz * anchorM[6]).coerceIn(-8f, 8f)
+                    offZ = (dx * anchorM[8] + dy * anchorM[9] + dz * anchorM[10]).coerceIn(-8f, 8f)
                 }
                 H_RESIZE -> if (gazeOk) {
                     val dNow = hypot(gazeX, gazeY)

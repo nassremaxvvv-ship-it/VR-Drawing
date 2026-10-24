@@ -9,6 +9,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.drawable.GradientDrawable
+import android.hardware.SensorManager
 import android.media.ExifInterface
 import android.net.Uri
 import android.opengl.GLSurfaceView
@@ -84,6 +85,7 @@ class MainActivity : ComponentActivity() {
         renderer = ArRenderer(this)
         renderer.scale = prefs.getFloat("scale", 1f)
         renderer.alpha = prefs.getFloat("alpha", 1f)
+        renderer.stableMode = prefs.getBoolean("stable", false)
 
         glView = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
@@ -178,7 +180,8 @@ class MainActivity : ComponentActivity() {
             ))
             addView(iconRow(
                 cmd("🔍", "Image Distance: nearer", true) { renderer.move(0f, 0f, 0.02f) },
-                cmd("🔭", "Image Distance: farther", true) { renderer.move(0f, 0f, -0.02f) }
+                cmd("🔭", "Image Distance: farther", true) { renderer.move(0f, 0f, -0.02f) },
+                cmd("🧭", "Stable mode", false) { toggleStable() }
             ))
         }
 
@@ -291,6 +294,13 @@ class MainActivity : ComponentActivity() {
         exitOverlay.visibility = View.GONE
     }
 
+    private fun toggleStable() {
+        val on = !renderer.stableMode
+        renderer.setStable(on)
+        prefs.edit().putBoolean("stable", on).apply()
+        showHint(if (on) "Stable mode ON: the camera is only a background" else "Camera tracking mode ON")
+    }
+
     private fun registerTap() {
         val now = System.currentTimeMillis()
         if (now - lastTapTime > 700) tapCount = 0
@@ -376,6 +386,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        renderer.startSensors(getSystemService(Context.SENSOR_SERVICE) as SensorManager)
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
             setStatus("The camera permission is needed to see your room.")
@@ -437,6 +448,8 @@ class MainActivity : ComponentActivity() {
             if (System.currentTimeMillis() > hintUntil) {
                 status.text = when {
                     !renderer.hasImage -> "Open the menu ⚙ and choose an image"
+                    renderer.stableMode && !renderer.gyroAvailable -> "This phone has no rotation sensor. Stable mode cannot work."
+                    !renderer.tracking && renderer.stableMode -> "Waiting for the rotation sensor..."
                     !renderer.tracking -> "Tracking lost. Step back and move the phone slowly."
                     !renderer.placed -> "Look where you want the image, then tap 📍"
                     renderer.uiLocked -> "Buttons hidden. Tap 3 times quickly to show them."
@@ -449,6 +462,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        renderer.stopSensors(getSystemService(Context.SENSOR_SERVICE) as SensorManager)
         handler.removeCallbacks(statusUpdater)
         glView.onPause()
         renderer.session = null
