@@ -85,7 +85,7 @@ class MainActivity : ComponentActivity() {
         renderer = ArRenderer(this)
         renderer.scale = prefs.getFloat("scale", 1f)
         renderer.alpha = prefs.getFloat("alpha", 1f)
-        renderer.stableMode = prefs.getBoolean("stable", false)
+        renderer.roomMode = prefs.getBoolean("room", false)
 
         glView = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
@@ -181,7 +181,13 @@ class MainActivity : ComponentActivity() {
             addView(iconRow(
                 cmd("🔍", "Image Distance: nearer", true) { renderer.move(0f, 0f, 0.02f) },
                 cmd("🔭", "Image Distance: farther", true) { renderer.move(0f, 0f, -0.02f) },
-                cmd("🧭", "Stable mode", false) { toggleStable() }
+                cmd("🧭", "Room mode / Camera mode", false) { toggleRoom() }
+            ))
+            addView(iconRow(
+                cmd("▲", "Walk forward", true) { walk(0.085f, 0f) },
+                cmd("▼", "Walk back", true) { walk(-0.085f, 0f) },
+                cmd("◀", "Walk left", true) { walk(0f, -0.085f) },
+                cmd("▶", "Walk right", true) { walk(0f, 0.085f) }
             ))
         }
 
@@ -251,7 +257,7 @@ class MainActivity : ComponentActivity() {
 
     /** An icon command. If repeat is true it keeps acting while the finger is held down. */
     private fun cmd(symbol: String, name: String, repeat: Boolean, action: () -> Unit): Button {
-        val b = circleButton(symbol, 52)
+        val b = circleButton(symbol, 44)
         val rep = object : Runnable {
             override fun run() {
                 action()
@@ -294,11 +300,30 @@ class MainActivity : ComponentActivity() {
         exitOverlay.visibility = View.GONE
     }
 
-    private fun toggleStable() {
-        val on = !renderer.stableMode
-        renderer.setStable(on)
-        prefs.edit().putBoolean("stable", on).apply()
-        showHint(if (on) "Stable mode ON: the camera is only a background" else "Camera tracking mode ON")
+    private fun walk(forward: Float, strafe: Float) {
+        if (renderer.roomMode) {
+            renderer.walk(forward, strafe)
+        } else {
+            showHint("Walking buttons work in room mode. In camera mode, just walk.")
+        }
+    }
+
+    private fun toggleRoom() {
+        val on = !renderer.roomMode
+        renderer.setRoom(on)
+        prefs.edit().putBoolean("room", on).apply()
+        if (on) {
+            renderer.session = null
+            try {
+                session?.pause()
+            } catch (e: Exception) {
+            }
+            showHint("Room mode: a virtual room. The camera is off.")
+            startAr()
+        } else {
+            showHint("Camera mode")
+            startAr()
+        }
     }
 
     private fun registerTap() {
@@ -387,7 +412,7 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         renderer.startSensors(getSystemService(Context.SENSOR_SERVICE) as SensorManager)
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+        if (!renderer.roomMode && checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
             setStatus("The camera permission is needed to see your room.")
             return
@@ -404,7 +429,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun askForImageOnce() {
+        if (!askedForImage) {
+            askedForImage = true
+            pickImage.launch(arrayOf("image/*"))
+        }
+    }
+
     private fun startAr() {
+        if (renderer.roomMode) {
+            renderer.session = null
+            glView.onResume()
+            askForImageOnce()
+            handler.removeCallbacks(statusUpdater)
+            handler.post(statusUpdater)
+            return
+        }
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+            setStatus("The camera permission is needed to see your room.")
+            return
+        }
         if (session == null) {
             try {
                 val installStatus = ArCoreApk.getInstance().requestInstall(this, userRequestedInstall)
@@ -435,10 +480,7 @@ class MainActivity : ComponentActivity() {
         renderer.session = session
         glView.onResume()
 
-        if (!askedForImage) {
-            askedForImage = true
-            pickImage.launch(arrayOf("image/*"))
-        }
+        askForImageOnce()
         handler.removeCallbacks(statusUpdater)
         handler.post(statusUpdater)
     }
@@ -448,10 +490,11 @@ class MainActivity : ComponentActivity() {
             if (System.currentTimeMillis() > hintUntil) {
                 status.text = when {
                     !renderer.hasImage -> "Open the menu ⚙ and choose an image"
-                    renderer.stableMode && !renderer.gyroAvailable -> "This phone has no rotation sensor. Stable mode cannot work."
-                    !renderer.tracking && renderer.stableMode -> "Waiting for the rotation sensor..."
+                    renderer.roomMode && !renderer.gyroAvailable -> "This phone has no rotation sensor. Room mode cannot work."
+                    !renderer.tracking && renderer.roomMode -> "Waiting for the rotation sensor..."
                     !renderer.tracking -> "Tracking lost. Step back and move the phone slowly."
                     !renderer.placed -> "Look where you want the image, then tap 📍"
+                    renderer.roomMode && !renderer.uiLocked -> "Room mode. Walk with ▲▼◀▶. Aim the dot at a circle and touch the screen."
                     renderer.uiLocked -> "Buttons hidden. Tap 3 times quickly to show them."
                     else -> "Aim the dot at a button, then touch and hold the screen"
                 }

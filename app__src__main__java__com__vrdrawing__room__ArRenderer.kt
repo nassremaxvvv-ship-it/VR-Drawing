@@ -25,6 +25,7 @@ import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
+import java.util.Random
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
@@ -51,8 +52,8 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     @Volatile var hasImage = false
     @Volatile var placed = false
 
-    // Stable mode: the camera is only a background. Head rotation comes from the gyroscope.
-    @Volatile var stableMode = false
+    // Room mode: a virtual 3D room. No camera, no ARCore tracking. Head rotation comes from the gyroscope.
+    @Volatile var roomMode = false
     @Volatile var gyroAvailable = true
     @Volatile private var gyroReady = false
     private val rotLock = Any()
@@ -67,10 +68,11 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     private val camX = floatArrayOf(1f, 0f, 0f)
     private val camY = floatArrayOf(0f, 1f, 0f)
     private val camZ = floatArrayOf(0f, 0f, 1f)
-
-    // The pointer dot and the buttons around the image can be hidden (locked)
-    @Volatile var uiLocked = false
-    @Volatile private var pressDown = false
+    private val roomPos = floatArrayOf(0f, 0f, 0f)
+    @Volatile private var roomYaw = 0f
+    @Volatile private var roomAlignPending = true
+    private var floorTex = 0
+    private var wallTex = 0
 
     @Volatile private var viewportChanged = true
     @Volatile private var placePending = false
@@ -138,6 +140,12 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     fun resetAll() {
         scale = 1f
         alpha = 1f
+        if (roomMode) {
+            roomPos[0] = 0f
+            roomPos[1] = 0f
+            roomPos[2] = 0f
+            roomAlignPending = true
+        }
         requestPlace()
     }
 
@@ -145,9 +153,33 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         pressDown = down
     }
 
-    fun setStable(on: Boolean) {
-        stableMode = on
+    fun setRoom(on: Boolean) {
+        roomMode = on
+        viewportChanged = true
+        roomPos[0] = 0f
+        roomPos[1] = 0f
+        roomPos[2] = 0f
+        roomAlignPending = true
         requestPlace()
+    }
+
+    /** Walk inside the virtual room (meters). Only used in room mode. */
+    fun walk(forward: Float, strafe: Float) {
+        var fx = -camZ[0]
+        var fz = -camZ[2]
+        val fl = sqrt(fx * fx + fz * fz)
+        if (fl < 1e-3f) return
+        fx /= fl
+        fz /= fl
+        var rx = camX[0]
+        var rz = camX[2]
+        val rl = sqrt(rx * rx + rz * rz)
+        if (rl > 1e-3f) {
+            rx /= rl
+            rz /= rl
+        }
+        roomPos[0] = (roomPos[0] + fx * forward + rx * strafe).coerceIn(-2.7f, 2.7f)
+        roomPos[2] = (roomPos[2] + fz * forward + rz * strafe).coerceIn(-2.7f, 2.7f)
     }
 
     private val sensorListener = object : SensorEventListener {
@@ -216,6 +248,8 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         whiteTex = makeTexture(white)
         reticleTex = makeTexture(makeReticle())
         for (i in 1..4) iconTex[i] = makeTexture(makeIcon(i))
+        floorTex = makeTexture(makeFloorBitmap(), true)
+        wallTex = makeTexture(makeWallBitmap(), true)
 
         lastBitmap?.let { pending.set(it) }
     }
@@ -228,6 +262,10 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
 
     override fun onDrawFrame(gl: GL10?) {
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        if (roomMode) {
+            drawRoomFrame()
+            return
+        }
         val s = session ?: return
 
         if (boundSession !== s) {
@@ -257,36 +295,27 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
             uvBuf.position(0)
         }
 
-        val viewW = if (vrMode) width / 2 else width
-        try {
-            camera.getProjectionMatrix(proj, 0, 0.05f, 100f)
-        } catch (e: Exception) {
-            Matrix.perspectiveM(proj, 0, 60f, viewW.toFloat() / height.toFloat(), 0.05f, 100f)
-        }
+        val isTracking = camera.trackingState == TrackingState.TRACKING
+        tracking = isTracking
 
-        if (stableMode) {
-            tracking = updateGyroCamera()
-        } else {
-            tracking = camera.trackingState == TrackingState.TRACKING
-            val dp = camera.displayOrientedPose
-            System.arraycopy(dp.translation, 0, camC, 0, 3)
-            System.arraycopy(dp.xAxis, 0, camX, 0, 3)
-            System.arraycopy(dp.yAxis, 0, camY, 0, 3)
-            System.arraycopy(dp.zAxis, 0, camZ, 0, 3)
-            camera.getViewMatrix(view, 0)
-        }
+        val dp = camera.displayOrientedPose
+        System.arraycopy(dp.translation, 0, camC, 0, 3)
+        System.arraycopy(dp.xAxis, 0, camX, 0, 3)
+        System.arraycopy(dp.yAxis, 0, camY, 0, 3)
+        System.arraycopy(dp.zAxis, 0, camZ, 0, 3)
 
         val bmp = pending.getAndSet(null)
         if (bmp != null) uploadImage(bmp)
 
-        if (placePending && imgTex != 0 && tracking) {
-            val ok = if (stableMode) placeStable() else placeInFront(s, camera)
-            if (ok) placePending = false
+        if (placePending && imgTex != 0 && isTracking) {
+            if (placeInFront(s, camera)) placePending = false
         }
 
+        camera.getProjectionMatrix(proj, 0, 0.05f, 100f)
+        camera.getViewMatrix(view, 0)
+
         val a = anchor
-        val showImage = tracking && imgTex != 0 &&
-            (if (stableMode) stablePlaced else (a != null && a.trackingState == TrackingState.TRACKING))
+        val showImage = isTracking && imgTex != 0 && a != null && a.trackingState == TrackingState.TRACKING
 
         if (showImage) {
             loadAnchorMatrix(a)
@@ -298,6 +327,36 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
             active = H_NONE
         }
 
+        drawEyes(showImage)
+    }
+
+    /** One frame of the virtual room. */
+    private fun drawRoomFrame() {
+        val viewW = if (vrMode) width / 2 else width
+        Matrix.perspectiveM(proj, 0, if (vrMode) 90f else 70f, viewW.toFloat() / height.toFloat(), 0.05f, 50f)
+        tracking = updateGyroCamera()
+
+        val bmp = pending.getAndSet(null)
+        if (bmp != null) uploadImage(bmp)
+        if (!tracking) return
+
+        if (placePending && imgTex != 0) {
+            if (placeStable()) placePending = false
+        }
+        val showImage = imgTex != 0 && stablePlaced
+        if (showImage) {
+            loadAnchorMatrix(null)
+            updateBase()
+            updateInteraction()
+            updateBase()
+        } else {
+            hovered = H_NONE
+            active = H_NONE
+        }
+        drawEyes(showImage)
+    }
+
+    private fun drawEyes(showImage: Boolean) {
         if (vrMode) {
             val half = width / 2
             GLES20.glViewport(0, 0, half, height)
@@ -310,7 +369,14 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         }
     }
 
-    /** Camera orientation from the gyroscope. The camera stays at the center of the room. */
+    private fun yawVec(v: FloatArray, c: Float, s: Float) {
+        val x = v[0] * c + v[2] * s
+        val z = -v[0] * s + v[2] * c
+        v[0] = x
+        v[2] = z
+    }
+
+    /** Camera orientation from the gyroscope; camera position is the walking position in the room. */
     private fun updateGyroCamera(): Boolean {
         if (!gyroReady) return false
         synchronized(rotLock) {
@@ -348,9 +414,26 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         camZ[0] = rotB[2]
         camZ[1] = rotB[8]
         camZ[2] = -rotB[5]
-        camC[0] = 0f
-        camC[1] = 0f
-        camC[2] = 0f
+
+        // Turn the room so that you start by facing the front wall
+        if (roomAlignPending) {
+            val fx = -camZ[0]
+            val fz = -camZ[2]
+            val hl = sqrt(fx * fx + fz * fz)
+            if (hl > 0.2f) {
+                roomYaw = -Math.atan2((-fx / hl).toDouble(), (-fz / hl).toDouble()).toFloat()
+                roomAlignPending = false
+            }
+        }
+        val cy = Math.cos(roomYaw.toDouble()).toFloat()
+        val sy = Math.sin(roomYaw.toDouble()).toFloat()
+        yawVec(camX, cy, sy)
+        yawVec(camY, cy, sy)
+        yawVec(camZ, cy, sy)
+
+        camC[0] = roomPos[0]
+        camC[1] = roomPos[1]
+        camC[2] = roomPos[2]
 
         view[0] = camX[0]
         view[1] = camY[0]
@@ -364,9 +447,9 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         view[9] = camY[2]
         view[10] = camZ[2]
         view[11] = 0f
-        view[12] = 0f
-        view[13] = 0f
-        view[14] = 0f
+        view[12] = -(camX[0] * camC[0] + camX[1] * camC[1] + camX[2] * camC[2])
+        view[13] = -(camY[0] * camC[0] + camY[1] * camC[1] + camY[2] * camC[2])
+        view[14] = -(camZ[0] * camC[0] + camZ[1] * camC[1] + camZ[2] * camC[2])
         view[15] = 1f
         return true
     }
@@ -379,13 +462,15 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         val pos: FloatArray
         if (hl < 1e-3f) {
             z = floatArrayOf(0f, 0f, 1f)
-            pos = floatArrayOf(0f, 0f, -DEFAULT_DISTANCE)
+            pos = floatArrayOf(camC[0], camC[1], camC[2] - DEFAULT_DISTANCE)
         } else {
             val fx = fx0 / hl
             val fz = fz0 / hl
             z = floatArrayOf(-fx, 0f, -fz)
-            pos = floatArrayOf(fx * DEFAULT_DISTANCE, 0f, fz * DEFAULT_DISTANCE)
+            pos = floatArrayOf(camC[0] + fx * DEFAULT_DISTANCE, camC[1], camC[2] + fz * DEFAULT_DISTANCE)
         }
+        pos[0] = pos[0].coerceIn(-2.8f, 2.8f)
+        pos[2] = pos[2].coerceIn(-2.8f, 2.8f)
         Matrix.setIdentityM(stableAnchor, 0)
         // columns: x axis, y axis, z axis, position
         stableAnchor[0] = z[2]
@@ -406,7 +491,7 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     }
 
     private fun loadAnchorMatrix(a: Anchor?) {
-        if (stableMode) {
+        if (roomMode) {
             System.arraycopy(stableAnchor, 0, anchorM, 0, 16)
         } else if (a != null) {
             a.pose.toMatrix(anchorM, 0)
@@ -620,7 +705,7 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     // ---------- Drawing ----------
 
     private fun drawScene(showImage: Boolean, eyeShift: Float, viewW: Int) {
-        drawBackground()
+        if (roomMode) drawRoom(eyeShift) else drawBackground()
         if (showImage) {
             val h = BASE_HEIGHT * scale
             val w = h * imgAspect
@@ -668,13 +753,14 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         }
     }
 
-    private fun drawTextured(tex: Int, m: FloatArray, r: Float, g: Float, b: Float, a: Float) {
+    private fun drawTextured(tex: Int, m: FloatArray, r: Float, g: Float, b: Float, a: Float, su: Float = 1f, sv: Float = 1f) {
         GLES20.glDisable(GLES20.GL_DEPTH_TEST)
         GLES20.glEnable(GLES20.GL_BLEND)
         GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
         GLES20.glUseProgram(imgProgram)
         GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(imgProgram, "uMvp"), 1, false, m, 0)
         GLES20.glUniform4f(GLES20.glGetUniformLocation(imgProgram, "uColor"), r, g, b, a)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(imgProgram, "uUvScale"), su, sv)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(imgProgram, "uTex"), 0)
@@ -720,14 +806,15 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         return p.coerceIn(256, 2048)
     }
 
-    private fun makeTexture(bmp: Bitmap): Int {
+    private fun makeTexture(bmp: Bitmap, repeat: Boolean = false): Int {
         val ids = IntArray(1)
         GLES20.glGenTextures(1, ids, 0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        val wrap = if (repeat) GLES20.GL_REPEAT else GLES20.GL_CLAMP_TO_EDGE
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, wrap)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, wrap)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
         GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
         return ids[0]
@@ -743,6 +830,83 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         imgAspect = bmp.width.toFloat() / bmp.height.toFloat()
         lastBitmap = bmp
         hasImage = true
+    }
+
+    // ---------- The virtual room ----------
+
+    private fun drawFace(
+        tex: Int, eyeShift: Float, tx: Float, ty: Float, tz: Float, rotY: Float, rotX: Float,
+        sx: Float, sy: Float, su: Float, sv: Float, r: Float, g: Float, b: Float
+    ) {
+        Matrix.setIdentityM(model, 0)
+        Matrix.translateM(model, 0, tx, ty, tz)
+        if (rotY != 0f) Matrix.rotateM(model, 0, rotY, 0f, 1f, 0f)
+        if (rotX != 0f) Matrix.rotateM(model, 0, rotX, 1f, 0f, 0f)
+        Matrix.scaleM(model, 0, sx, sy, 1f)
+        Matrix.setIdentityM(tmp, 0)
+        Matrix.translateM(tmp, 0, eyeShift, 0f, 0f)
+        Matrix.multiplyMM(viewEye, 0, tmp, 0, view, 0)
+        Matrix.multiplyMM(mv, 0, viewEye, 0, model, 0)
+        Matrix.multiplyMM(mvp, 0, proj, 0, mv, 0)
+        GLES20.glDisable(GLES20.GL_BLEND)
+        drawTextured(tex, mvp, r, g, b, 1f, su, sv)
+    }
+
+    /** Empty room: 6 m x 6 m, 3 m high. Eye level is at y = 0. */
+    private fun drawRoom(eyeShift: Float) {
+        val w = ROOM_W
+        val d = ROOM_D
+        val floorY = -1.6f
+        val ceilY = 1.4f
+        val h = ceilY - floorY
+        val midY = (floorY + ceilY) / 2f
+        drawFace(floorTex, eyeShift, 0f, floorY, 0f, 0f, -90f, w, d, w, d, 1f, 1f, 1f)
+        drawFace(wallTex, eyeShift, 0f, ceilY, 0f, 0f, 90f, w, d, w / 2f, d / 2f, 1f, 1f, 1f)
+        drawFace(wallTex, eyeShift, 0f, midY, -d / 2f, 0f, 0f, w, h, w / 2f, h / 2f, 1f, 0.97f, 0.93f)
+        drawFace(wallTex, eyeShift, 0f, midY, d / 2f, 180f, 0f, w, h, w / 2f, h / 2f, 0.86f, 0.84f, 0.82f)
+        drawFace(wallTex, eyeShift, -w / 2f, midY, 0f, 90f, 0f, d, h, d / 2f, h / 2f, 0.9f, 0.88f, 0.85f)
+        drawFace(wallTex, eyeShift, w / 2f, midY, 0f, -90f, 0f, d, h, d / 2f, h / 2f, 0.9f, 0.88f, 0.85f)
+    }
+
+    private fun makeFloorBitmap(): Bitmap {
+        val n = 256
+        val bmp = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val rnd = Random(7)
+        val fill = Paint()
+        val plankH = 64
+        for (row in 0 until n / plankH) {
+            val y0 = row * plankH
+            var x = -rnd.nextInt(120)
+            while (x < n) {
+                val len = 120 + rnd.nextInt(100)
+                val k = 0.86f + rnd.nextFloat() * 0.22f
+                fill.color = Color.rgb((166 * k).toInt().coerceAtMost(255), (124 * k).toInt().coerceAtMost(255), (82 * k).toInt().coerceAtMost(255))
+                c.drawRect(x.toFloat(), y0.toFloat(), (x + len).toFloat(), (y0 + plankH).toFloat(), fill)
+                x += len
+            }
+        }
+        val line = Paint().apply {
+            color = 0x66402A18
+            strokeWidth = 2f
+        }
+        for (row in 0 until n / plankH) c.drawLine(0f, (row * plankH).toFloat(), n.toFloat(), (row * plankH).toFloat(), line)
+        return bmp
+    }
+
+    private fun makeWallBitmap(): Bitmap {
+        val n = 256
+        val bmp = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        c.drawColor(0xFFEDE8DF.toInt())
+        val rnd = Random(3)
+        val dot = Paint()
+        for (i in 0 until 2500) {
+            val v = 205 + rnd.nextInt(40)
+            dot.color = Color.argb(28, v, v - 4, v - 10)
+            c.drawCircle(rnd.nextInt(n).toFloat(), rnd.nextInt(n).toFloat(), 1f + rnd.nextInt(3), dot)
+        }
+        return bmp
     }
 
     private fun makeReticle(): Bitmap {
@@ -858,6 +1022,8 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         const val BASE_HEIGHT = 0.5f
         const val DEFAULT_DISTANCE = 1.5f
         const val IPD = 0.064f
+        const val ROOM_W = 6f
+        const val ROOM_D = 6f
 
         const val H_NONE = 0
         const val H_RESIZE = 1
@@ -880,10 +1046,11 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         """
         const val IMG_VS = """
             uniform mat4 uMvp;
+            uniform vec2 uUvScale;
             attribute vec4 aPos;
             attribute vec2 aUv;
             varying vec2 vUv;
-            void main() { gl_Position = uMvp * aPos; vUv = aUv; }
+            void main() { gl_Position = uMvp * aPos; vUv = aUv * uUvScale; }
         """
         const val IMG_FS = """
             precision mediump float;
