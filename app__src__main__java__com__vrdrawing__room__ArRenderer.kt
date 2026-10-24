@@ -74,6 +74,10 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     private var floorTex = 0
     private var wallTex = 0
 
+    // The pointer dot and the buttons around the image can be hidden (locked)
+    @Volatile var uiLocked = false
+    @Volatile private var pressDown = false
+
     @Volatile private var viewportChanged = true
     @Volatile private var placePending = false
     private val pending = AtomicReference<Bitmap?>(null)
