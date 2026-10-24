@@ -136,7 +136,7 @@ class MainActivity : ComponentActivity() {
 
     private fun bigButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
         text = label
-        isAllCaps = false
+        setAllCaps(false)
         textSize = 14f
         minHeight = dp(52)
         minimumHeight = dp(52)
@@ -259,7 +259,7 @@ class MainActivity : ComponentActivity() {
         startAr()
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
             startAr()
