@@ -1,12 +1,18 @@
 package com.vrdrawing.room
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.RectF
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.opengl.Matrix
 import com.google.ar.core.Anchor
+import com.google.ar.core.Camera
 import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Pose
 import com.google.ar.core.Session
@@ -17,6 +23,9 @@ import java.nio.FloatBuffer
 import java.util.concurrent.atomic.AtomicReference
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.abs
+import kotlin.math.hypot
+import kotlin.math.sqrt
 
 class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
 
@@ -32,11 +41,17 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     @Volatile var offY = 0f
     @Volatile var offZ = 0f
     @Volatile var scale = 1f
+    @Volatile var alpha = 1f
     @Volatile var tracking = false
     @Volatile var hasImage = false
+    @Volatile var placed = false
+
+    // The pointer dot and the buttons around the image can be hidden (locked)
+    @Volatile var uiLocked = false
+    @Volatile private var pressDown = false
 
     @Volatile private var viewportChanged = true
-    @Volatile private var placeRequested = false
+    @Volatile private var placePending = false
     private val pending = AtomicReference<Bitmap?>(null)
     private var lastBitmap: Bitmap? = null
 
@@ -50,6 +65,23 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     private var imgProgram = 0
     private var imgTex = 0
     private var imgAspect = 1f
+    private var whiteTex = 0
+    private var reticleTex = 0
+    private val iconTex = IntArray(5)
+
+    // Pointer interaction state (GL thread)
+    private var hovered = H_NONE
+    private var active = H_NONE
+    private var prevPress = false
+    private var gazeOk = false
+    private var gazeX = 0f
+    private var gazeY = 0f
+    private var gazeFy = 0f
+    private var grabX = 0f
+    private var grabY = 0f
+    private var grabAlpha = 1f
+    private var grabOffZ = 0f
+    private var grabFy = 0f
 
     private val quadArr = floatArrayOf(-1f, -1f, -1f, 1f, 1f, -1f, 1f, 1f)
     private val uvArr = floatArrayOf(0f, 1f, 0f, 0f, 1f, 1f, 1f, 0f)
@@ -62,32 +94,42 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
     private val view = FloatArray(16)
     private val viewEye = FloatArray(16)
     private val tmp = FloatArray(16)
+    private val base = FloatArray(16)
     private val model = FloatArray(16)
     private val mv = FloatArray(16)
     private val mvp = FloatArray(16)
 
     // ---- Called from the UI thread ----
-    fun setImage(bmp: Bitmap, place: Boolean) {
+    fun setImage(bmp: Bitmap) {
         pending.set(bmp)
-        if (place) placeRequested = true
     }
 
+    /** Hang the image in the air, straight ahead of where the user is looking. */
     fun requestPlace() {
         offX = 0f
         offY = 0f
         offZ = 0f
-        placeRequested = true
+        placePending = true
     }
 
     fun resetAll() {
         scale = 1f
+        alpha = 1f
         requestPlace()
+    }
+
+    fun setPress(down: Boolean) {
+        pressDown = down
+    }
+
+    fun fade(delta: Float) {
+        alpha = (alpha + delta).coerceIn(0.1f, 1f)
     }
 
     fun move(dx: Float, dy: Float, dz: Float) {
         offX += dx
         offY += dy
-        offZ = (offZ + dz).coerceIn(-10f, 3f)
+        offZ = (offZ + dz).coerceIn(-3f, 1f)
     }
 
     fun zoom(factor: Float) {
@@ -109,6 +151,13 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         imgProgram = makeProgram(IMG_VS, IMG_FS)
         imgTex = 0
         boundSession = null
+
+        val white = Bitmap.createBitmap(4, 4, Bitmap.Config.ARGB_8888)
+        white.eraseColor(Color.WHITE)
+        whiteTex = makeTexture(white)
+        reticleTex = makeTexture(makeReticle())
+        for (i in 1..4) iconTex[i] = makeTexture(makeIcon(i))
+
         lastBitmap?.let { pending.set(it) }
     }
 
@@ -155,11 +204,8 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         val bmp = pending.getAndSet(null)
         if (bmp != null) uploadImage(bmp)
 
-        if (placeRequested && isTracking && imgTex != 0) {
-            anchor?.detach()
-            val pose = camera.displayOrientedPose.compose(Pose.makeTranslation(0f, 0f, -DEFAULT_DISTANCE))
-            anchor = s.createAnchor(pose)
-            placeRequested = false
+        if (placePending && imgTex != 0 && isTracking) {
+            if (placeInFront(s, camera)) placePending = false
         }
 
         camera.getProjectionMatrix(proj, 0, 0.05f, 100f)
@@ -168,19 +214,289 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         val a = anchor
         val showImage = isTracking && imgTex != 0 && a != null && a.trackingState == TrackingState.TRACKING
 
+        if (showImage) {
+            updateBase(a!!)
+            updateInteraction(camera)
+            updateBase(a)
+        } else {
+            hovered = H_NONE
+            active = H_NONE
+        }
+
         if (vrMode) {
             val half = width / 2
             GLES20.glViewport(0, 0, half, height)
-            drawBackground()
-            if (showImage) drawImage(a!!, IPD / 2f)
+            drawScene(showImage, IPD / 2f, half)
             GLES20.glViewport(half, 0, half, height)
-            drawBackground()
-            if (showImage) drawImage(a!!, -IPD / 2f)
+            drawScene(showImage, -IPD / 2f, half)
         } else {
             GLES20.glViewport(0, 0, width, height)
-            drawBackground()
-            if (showImage) drawImage(a!!, 0f)
+            drawScene(showImage, 0f, width)
         }
+    }
+
+    private fun updateBase(a: Anchor) {
+        a.pose.toMatrix(base, 0)
+        Matrix.translateM(base, 0, offX, offY, offZ)
+    }
+
+    // ---------- Pointer (the dot in the middle of the screen) ----------
+
+    private fun handleX(id: Int, w: Float): Float = when (id) {
+        H_RESIZE -> -w / 2f - 0.03f
+        H_DISTANCE -> w / 2f + 0.03f
+        H_FADE -> w / 2f + 0.03f
+        else -> 0f
+    }
+
+    private fun handleY(id: Int, h: Float): Float = when (id) {
+        H_RESIZE -> -h / 2f - 0.03f
+        H_MOVE -> -h / 2f - 0.11f
+        H_DISTANCE -> -h / 2f - 0.03f
+        else -> h / 2f + 0.03f
+    }
+
+    private fun handleSize(id: Int): Float = if (id == H_MOVE) 0.15f else 0.11f
+
+    /** Finds where the center-of-screen ray crosses the plane of the image. */
+    private fun computeGaze(camera: Camera): Boolean {
+        val dp = camera.displayOrientedPose
+        val c = dp.translation
+        val zc = dp.zAxis
+        val fx = -zc[0]
+        val fy = -zc[1]
+        val fz = -zc[2]
+        gazeFy = fy
+        val nx = base[8]
+        val ny = base[9]
+        val nz = base[10]
+        val denom = fx * nx + fy * ny + fz * nz
+        if (abs(denom) < 1e-4f) return false
+        val ox = base[12]
+        val oy = base[13]
+        val oz = base[14]
+        val t = ((ox - c[0]) * nx + (oy - c[1]) * ny + (oz - c[2]) * nz) / denom
+        if (t <= 0f) return false
+        val ix = c[0] + fx * t - ox
+        val iy = c[1] + fy * t - oy
+        val iz = c[2] + fz * t - oz
+        gazeX = ix * base[0] + iy * base[1] + iz * base[2]
+        gazeY = ix * base[4] + iy * base[5] + iz * base[6]
+        return true
+    }
+
+    private fun updateInteraction(camera: Camera) {
+        gazeOk = computeGaze(camera)
+        if (uiLocked) {
+            hovered = H_NONE
+            active = H_NONE
+            prevPress = pressDown
+            return
+        }
+        val h = BASE_HEIGHT * scale
+        val w = h * imgAspect
+
+        hovered = H_NONE
+        if (gazeOk) {
+            var best = Float.MAX_VALUE
+            for (id in 1..4) {
+                val d = hypot(gazeX - handleX(id, w), gazeY - handleY(id, h))
+                val r = handleSize(id) * 0.65f
+                if (d < r && d < best) {
+                    best = d
+                    hovered = id
+                }
+            }
+        }
+
+        val down = pressDown
+        if (down && !prevPress && hovered != H_NONE && gazeOk) {
+            active = hovered
+            grabX = gazeX
+            grabY = gazeY
+            grabAlpha = alpha
+            grabOffZ = offZ
+            grabFy = gazeFy
+        }
+        if (!down) active = H_NONE
+        prevPress = down
+
+        if (active != H_NONE) {
+            when (active) {
+                H_MOVE -> if (gazeOk) {
+                    offX += gazeX - grabX
+                    offY += gazeY - grabY
+                }
+                H_RESIZE -> if (gazeOk) {
+                    val dNow = hypot(gazeX, gazeY)
+                    val dGrab = hypot(grabX, grabY)
+                    if (dGrab > 0.03f) zoom((dNow / dGrab).coerceIn(0.92f, 1.08f))
+                    grabX = gazeX
+                    grabY = gazeY
+                }
+                H_DISTANCE -> {
+                    offZ = (grabOffZ - (gazeFy - grabFy) * 3f).coerceIn(-3f, 1f)
+                }
+                H_FADE -> if (gazeOk) {
+                    alpha = (grabAlpha + (gazeX - grabX) * 2f).coerceIn(0.1f, 1f)
+                }
+            }
+            hovered = active
+        }
+    }
+
+    // ---------- Placement ----------
+
+    /**
+     * Anchors the image in free space, about 1.5 m ahead at eye level,
+     * upright and facing the user. No wall or surface detection is used.
+     */
+    private fun placeInFront(s: Session, camera: Camera): Boolean {
+        try {
+            val dp = camera.displayOrientedPose
+            val c = dp.translation
+            val zAxis = dp.zAxis
+            var fx = -zAxis[0]
+            val fy = -zAxis[1]
+            var fz = -zAxis[2]
+            val hl = sqrt(fx * fx + fz * fz)
+            val pos: FloatArray
+            val z: FloatArray
+            if (hl < 1e-3f) {
+                pos = floatArrayOf(c[0] + fx * DEFAULT_DISTANCE, c[1] + fy * DEFAULT_DISTANCE, c[2] + fz * DEFAULT_DISTANCE)
+                z = floatArrayOf(0f, 0f, 1f)
+            } else {
+                fx /= hl
+                fz /= hl
+                pos = floatArrayOf(c[0] + fx * DEFAULT_DISTANCE, c[1], c[2] + fz * DEFAULT_DISTANCE)
+                z = floatArrayOf(-fx, 0f, -fz)
+            }
+            val yAxis = floatArrayOf(0f, 1f, 0f)
+            val xAxis = floatArrayOf(z[2], 0f, -z[0])
+            val q = quatFromAxes(xAxis, yAxis, z)
+            val newAnchor = s.createAnchor(Pose(pos, q))
+            anchor?.detach()
+            anchor = newAnchor
+            placed = true
+            return true
+        } catch (e: Exception) {
+            return false
+        }
+    }
+
+    private fun quatFromAxes(x: FloatArray, y: FloatArray, z: FloatArray): FloatArray {
+        val m00 = x[0]
+        val m10 = x[1]
+        val m20 = x[2]
+        val m01 = y[0]
+        val m11 = y[1]
+        val m21 = y[2]
+        val m02 = z[0]
+        val m12 = z[1]
+        val m22 = z[2]
+        val tr = m00 + m11 + m22
+        val q = FloatArray(4)
+        if (tr > 0f) {
+            val s = sqrt(tr + 1f) * 2f
+            q[3] = 0.25f * s
+            q[0] = (m21 - m12) / s
+            q[1] = (m02 - m20) / s
+            q[2] = (m10 - m01) / s
+        } else if (m00 > m11 && m00 > m22) {
+            val s = sqrt(1f + m00 - m11 - m22) * 2f
+            q[3] = (m21 - m12) / s
+            q[0] = 0.25f * s
+            q[1] = (m01 + m10) / s
+            q[2] = (m02 + m20) / s
+        } else if (m11 > m22) {
+            val s = sqrt(1f + m11 - m00 - m22) * 2f
+            q[3] = (m02 - m20) / s
+            q[0] = (m01 + m10) / s
+            q[1] = 0.25f * s
+            q[2] = (m12 + m21) / s
+        } else {
+            val s = sqrt(1f + m22 - m00 - m11) * 2f
+            q[3] = (m10 - m01) / s
+            q[0] = (m02 + m20) / s
+            q[1] = (m12 + m21) / s
+            q[2] = 0.25f * s
+        }
+        return q
+    }
+
+    // ---------- Drawing ----------
+
+    private fun drawScene(showImage: Boolean, eyeShift: Float, viewW: Int) {
+        drawBackground()
+        if (showImage) {
+            val h = BASE_HEIGHT * scale
+            val w = h * imgAspect
+            drawPiece(imgTex, 0f, 0f, w, h, eyeShift, 1f, 1f, 1f, alpha)
+            if (!uiLocked) {
+                val t = 0.004f
+                drawPiece(whiteTex, 0f, h / 2f, w + t, t, eyeShift, 1f, 1f, 1f, 0.55f)
+                drawPiece(whiteTex, 0f, -h / 2f, w + t, t, eyeShift, 1f, 1f, 1f, 0.55f)
+                drawPiece(whiteTex, -w / 2f, 0f, t, h + t, eyeShift, 1f, 1f, 1f, 0.55f)
+                drawPiece(whiteTex, w / 2f, 0f, t, h + t, eyeShift, 1f, 1f, 1f, 0.55f)
+                for (id in 1..4) {
+                    val k = if (hovered == id) 1.25f else 1f
+                    val sz = handleSize(id) * k
+                    val a = if (hovered == id) 1f else 0.85f
+                    drawPiece(iconTex[id], handleX(id, w), handleY(id, h), sz, sz, eyeShift, 1f, 1f, 1f, a)
+                }
+            }
+        }
+        if (!uiLocked) drawReticle(viewW)
+    }
+
+    private fun drawPiece(
+        tex: Int, tx: Float, ty: Float, sx: Float, sy: Float, eyeShift: Float,
+        r: Float, g: Float, b: Float, a: Float
+    ) {
+        System.arraycopy(base, 0, model, 0, 16)
+        Matrix.translateM(model, 0, tx, ty, 0f)
+        Matrix.scaleM(model, 0, sx, sy, 1f)
+        Matrix.setIdentityM(tmp, 0)
+        Matrix.translateM(tmp, 0, eyeShift, 0f, 0f)
+        Matrix.multiplyMM(viewEye, 0, tmp, 0, view, 0)
+        Matrix.multiplyMM(mv, 0, viewEye, 0, model, 0)
+        Matrix.multiplyMM(mvp, 0, proj, 0, mv, 0)
+        drawTextured(tex, mvp, r, g, b, a)
+    }
+
+    private fun drawReticle(viewW: Int) {
+        val size = if (hovered != H_NONE) 0.09f else 0.07f
+        Matrix.setIdentityM(tmp, 0)
+        Matrix.scaleM(tmp, 0, size * height / viewW, size, 1f)
+        if (hovered != H_NONE) {
+            drawTextured(reticleTex, tmp, 0.4f, 1f, 0.5f, 1f)
+        } else {
+            drawTextured(reticleTex, tmp, 1f, 1f, 1f, 1f)
+        }
+    }
+
+    private fun drawTextured(tex: Int, m: FloatArray, r: Float, g: Float, b: Float, a: Float) {
+        GLES20.glDisable(GLES20.GL_DEPTH_TEST)
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
+        GLES20.glUseProgram(imgProgram)
+        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(imgProgram, "uMvp"), 1, false, m, 0)
+        GLES20.glUniform4f(GLES20.glGetUniformLocation(imgProgram, "uColor"), r, g, b, a)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(imgProgram, "uTex"), 0)
+        val pos = GLES20.glGetAttribLocation(imgProgram, "aPos")
+        val uv = GLES20.glGetAttribLocation(imgProgram, "aUv")
+        imgPosBuf.position(0)
+        imgUvBuf.position(0)
+        GLES20.glEnableVertexAttribArray(pos)
+        GLES20.glEnableVertexAttribArray(uv)
+        GLES20.glVertexAttribPointer(pos, 2, GLES20.GL_FLOAT, false, 0, imgPosBuf)
+        GLES20.glVertexAttribPointer(uv, 2, GLES20.GL_FLOAT, false, 0, imgUvBuf)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(pos)
+        GLES20.glDisableVertexAttribArray(uv)
+        GLES20.glDisable(GLES20.GL_BLEND)
     }
 
     private fun drawBackground() {
@@ -203,55 +519,124 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         GLES20.glDisableVertexAttribArray(uv)
     }
 
-    private fun drawImage(a: Anchor, eyeShift: Float) {
-        a.pose.toMatrix(model, 0)
-        Matrix.translateM(model, 0, offX, offY, offZ)
-        val h = BASE_HEIGHT * scale
-        Matrix.scaleM(model, 0, h * imgAspect, h, 1f)
+    // ---------- Textures ----------
 
-        Matrix.setIdentityM(tmp, 0)
-        Matrix.translateM(tmp, 0, eyeShift, 0f, 0f)
-        Matrix.multiplyMM(viewEye, 0, tmp, 0, view, 0)
-        Matrix.multiplyMM(mv, 0, viewEye, 0, model, 0)
-        Matrix.multiplyMM(mvp, 0, proj, 0, mv, 0)
-
-        GLES20.glEnable(GLES20.GL_BLEND)
-        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
-        GLES20.glUseProgram(imgProgram)
-        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(imgProgram, "uMvp"), 1, false, mvp, 0)
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, imgTex)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(imgProgram, "uTex"), 0)
-        val pos = GLES20.glGetAttribLocation(imgProgram, "aPos")
-        val uv = GLES20.glGetAttribLocation(imgProgram, "aUv")
-        imgPosBuf.position(0)
-        imgUvBuf.position(0)
-        GLES20.glEnableVertexAttribArray(pos)
-        GLES20.glEnableVertexAttribArray(uv)
-        GLES20.glVertexAttribPointer(pos, 2, GLES20.GL_FLOAT, false, 0, imgPosBuf)
-        GLES20.glVertexAttribPointer(uv, 2, GLES20.GL_FLOAT, false, 0, imgUvBuf)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-        GLES20.glDisableVertexAttribArray(pos)
-        GLES20.glDisableVertexAttribArray(uv)
-        GLES20.glDisable(GLES20.GL_BLEND)
+    private fun pot(n: Int): Int {
+        val lo = Integer.highestOneBit(n.coerceAtLeast(1))
+        val p = if (n - lo > lo / 2) lo * 2 else lo
+        return p.coerceIn(256, 2048)
     }
 
-    private fun uploadImage(bmp: Bitmap) {
-        if (imgTex == 0) {
-            val ids = IntArray(1)
-            GLES20.glGenTextures(1, ids, 0)
-            imgTex = ids[0]
-        }
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, imgTex)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+    private fun makeTexture(bmp: Bitmap): Int {
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR_MIPMAP_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+        GLES20.glGenerateMipmap(GLES20.GL_TEXTURE_2D)
+        return ids[0]
+    }
+
+    private fun uploadImage(bmp: Bitmap) {
+        // Power-of-two size + mipmaps removes the shimmering when the phone moves.
+        val pw = pot(bmp.width)
+        val ph = pot(bmp.height)
+        val scaled = if (pw == bmp.width && ph == bmp.height) bmp else Bitmap.createScaledBitmap(bmp, pw, ph, true)
+        if (imgTex != 0) GLES20.glDeleteTextures(1, intArrayOf(imgTex), 0)
+        imgTex = makeTexture(scaled)
         imgAspect = bmp.width.toFloat() / bmp.height.toFloat()
         lastBitmap = bmp
         hasImage = true
     }
+
+    private fun makeReticle(): Bitmap {
+        val bmp = Bitmap.createBitmap(64, 64, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val dark = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xAA000000.toInt()
+            style = Paint.Style.FILL
+        }
+        val light = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        c.drawCircle(32f, 32f, 20f, dark)
+        c.drawCircle(32f, 32f, 13f, light)
+        return bmp
+    }
+
+    private fun arrowHead(c: Canvas, p: Paint, tipX: Float, tipY: Float, dx: Float, dy: Float) {
+        val bx = tipX - dx * 22f
+        val by = tipY - dy * 22f
+        val px = -dy * 13f
+        val py = dx * 13f
+        val path = Path()
+        path.moveTo(tipX, tipY)
+        path.lineTo(bx + px, by + py)
+        path.lineTo(bx - px, by - py)
+        path.close()
+        c.drawPath(path, p)
+    }
+
+    private fun makeIcon(kind: Int): Bitmap {
+        val n = 128
+        val bmp = Bitmap.createBitmap(n, n, Bitmap.Config.ARGB_8888)
+        val c = Canvas(bmp)
+        val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xE61C2126.toInt()
+            style = Paint.Style.FILL
+        }
+        val ring = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = 5f
+        }
+        val line = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = 8f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        val solid = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        c.drawCircle(64f, 64f, 60f, fill)
+        c.drawCircle(64f, 64f, 60f, ring)
+        when (kind) {
+            H_MOVE -> {
+                c.drawLine(64f, 30f, 64f, 98f, line)
+                c.drawLine(30f, 64f, 98f, 64f, line)
+                arrowHead(c, solid, 64f, 18f, 0f, -1f)
+                arrowHead(c, solid, 64f, 110f, 0f, 1f)
+                arrowHead(c, solid, 18f, 64f, -1f, 0f)
+                arrowHead(c, solid, 110f, 64f, 1f, 0f)
+            }
+            H_RESIZE -> {
+                c.drawLine(40f, 88f, 88f, 40f, line)
+                arrowHead(c, solid, 28f, 100f, -0.7071f, 0.7071f)
+                arrowHead(c, solid, 100f, 28f, 0.7071f, -0.7071f)
+            }
+            H_DISTANCE -> {
+                c.drawRect(32f, 32f, 96f, 96f, line)
+                c.drawRect(52f, 52f, 76f, 76f, line)
+            }
+            H_FADE -> {
+                c.drawCircle(64f, 64f, 30f, line)
+                val half = Path()
+                half.addArc(RectF(34f, 34f, 94f, 94f), 90f, 180f)
+                half.close()
+                c.drawPath(half, solid)
+            }
+        }
+        return bmp
+    }
+
+    // ---------- GL helpers ----------
 
     private fun makeProgram(vs: String, fs: String): Int {
         val v = compile(GLES20.GL_VERTEX_SHADER, vs)
@@ -281,6 +666,12 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
         const val DEFAULT_DISTANCE = 1.5f
         const val IPD = 0.064f
 
+        const val H_NONE = 0
+        const val H_RESIZE = 1
+        const val H_MOVE = 2
+        const val H_DISTANCE = 3
+        const val H_FADE = 4
+
         const val BG_VS = """
             attribute vec4 aPos;
             attribute vec2 aUv;
@@ -305,7 +696,11 @@ class ArRenderer(private val activity: MainActivity) : GLSurfaceView.Renderer {
             precision mediump float;
             varying vec2 vUv;
             uniform sampler2D uTex;
-            void main() { gl_FragColor = texture2D(uTex, vUv); }
+            uniform vec4 uColor;
+            void main() {
+                vec4 c = texture2D(uTex, vUv);
+                gl_FragColor = vec4(c.rgb * uColor.rgb, c.a * uColor.a);
+            }
         """
     }
 }

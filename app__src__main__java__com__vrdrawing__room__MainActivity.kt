@@ -8,14 +8,18 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.drawable.GradientDrawable
 import android.media.ExifInterface
 import android.net.Uri
 import android.opengl.GLSurfaceView
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Gravity
+import android.view.GestureDetector
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -34,12 +38,19 @@ class MainActivity : ComponentActivity() {
     private lateinit var glView: GLSurfaceView
     private lateinit var renderer: ArRenderer
     private lateinit var controls: LinearLayout
+    private lateinit var panel: LinearLayout
+    private lateinit var bubble: Button
     private lateinit var status: TextView
     private lateinit var exitOverlay: View
 
     private var session: Session? = null
     private var userRequestedInstall = true
-    private var restoredImage = false
+    private var askedForImage = false
+    private var hintUntil = 0L
+    private var downTime = 0L
+    private var multiTouch = false
+    private var tapCount = 0
+    private var lastTapTime = 0L
     private val handler = Handler(Looper.getMainLooper())
     private val prefs by lazy { getSharedPreferences("vr_drawing", Context.MODE_PRIVATE) }
 
@@ -52,6 +63,11 @@ class MainActivity : ComponentActivity() {
             prefs.edit().putString("uri", uri.toString()).apply()
             renderer.requestPlace()
             loadImage(uri)
+        } else if (!renderer.hasImage) {
+            prefs.getString("uri", null)?.let {
+                renderer.requestPlace()
+                loadImage(Uri.parse(it))
+            }
         }
     }
 
@@ -66,10 +82,8 @@ class MainActivity : ComponentActivity() {
         hideSystemBars()
 
         renderer = ArRenderer(this)
-        renderer.offX = prefs.getFloat("ox", 0f)
-        renderer.offY = prefs.getFloat("oy", 0f)
-        renderer.offZ = prefs.getFloat("oz", 0f)
         renderer.scale = prefs.getFloat("scale", 1f)
+        renderer.alpha = prefs.getFloat("alpha", 1f)
 
         glView = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
@@ -78,43 +92,118 @@ class MainActivity : ComponentActivity() {
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
 
+        // The dot in the middle of the screen is the pointer.
+        // Touch the screen = press whatever the dot is on. Two fingers = resize.
+        // 4 quick taps hide the buttons and the dot. 3 quick taps bring them back.
+        val scaleDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                renderer.zoom(detector.scaleFactor)
+                return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                persist()
+            }
+        })
+        glView.setOnTouchListener { _, ev ->
+            scaleDetector.onTouchEvent(ev)
+            when (ev.actionMasked) {
+                MotionEvent.ACTION_DOWN -> {
+                    downTime = System.currentTimeMillis()
+                    multiTouch = false
+                    renderer.setPress(true)
+                }
+                MotionEvent.ACTION_POINTER_DOWN -> {
+                    multiTouch = true
+                    renderer.setPress(false)
+                }
+                MotionEvent.ACTION_UP -> {
+                    renderer.setPress(false)
+                    persist()
+                    if (!multiTouch && System.currentTimeMillis() - downTime < 350) registerTap()
+                }
+                MotionEvent.ACTION_CANCEL -> renderer.setPress(false)
+            }
+            true
+        }
+
         val root = FrameLayout(this)
         root.addView(glView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
 
         status = TextView(this).apply {
             setTextColor(Color.WHITE)
-            setBackgroundColor(0x99000000.toInt())
-            textSize = 16f
-            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(16).toFloat()
+                setColor(0x99000000.toInt())
+            }
+            textSize = 14f
+            setPadding(dp(14), dp(6), dp(14), dp(6))
             text = "Starting..."
         }
+        root.addView(
+            status,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply {
+                    gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+                    topMargin = dp(10)
+                }
+        )
 
-        val topRow = row(
-            bigButton("Choose Image") { pickImage.launch(arrayOf("image/*")) },
-            bigButton("Place Here") { renderer.requestPlace(); persist() },
-            bigButton("Enter VR Mode") { enterVr() },
-            bigButton("Reset View") { renderer.resetAll(); persist() }
-        )
-        val bottomRow = row(
-            holdButton("Move ◀") { renderer.move(-0.01f, 0f, 0f) },
-            holdButton("Move ▶") { renderer.move(0.01f, 0f, 0f) },
-            holdButton("Move ▲") { renderer.move(0f, 0.01f, 0f) },
-            holdButton("Move ▼") { renderer.move(0f, -0.01f, 0f) },
-            holdButton("Resize −") { renderer.zoom(0.985f) },
-            holdButton("Resize +") { renderer.zoom(1.015f) },
-            holdButton("Distance Near") { renderer.move(0f, 0f, 0.02f) },
-            holdButton("Distance Far") { renderer.move(0f, 0f, -0.02f) }
-        )
-        val spacer = View(this)
+        // Icon commands (opened from the bubble)
+        panel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            background = GradientDrawable().apply {
+                cornerRadius = dp(22).toFloat()
+                setColor(0x88000000.toInt())
+            }
+            addView(iconRow(
+                cmd("🖼", "Choose Image", false) { pickImage.launch(arrayOf("image/*")) },
+                cmd("📍", "Place Here", false) { renderer.requestPlace() },
+                cmd("🥽", "Enter VR Mode", false) { enterVr() },
+                cmd("↺", "Reset View", false) { renderer.resetAll() }
+            ))
+            addView(iconRow(
+                cmd("➕", "Resize +", true) { renderer.zoom(1.015f) },
+                cmd("➖", "Resize −", true) { renderer.zoom(0.985f) },
+                cmd("🔆", "More visible", true) { renderer.fade(0.02f) },
+                cmd("🔅", "More transparent", true) { renderer.fade(-0.02f) }
+            ))
+            addView(iconRow(
+                cmd("⬅", "Move left", true) { renderer.move(-0.01f, 0f, 0f) },
+                cmd("➡", "Move right", true) { renderer.move(0.01f, 0f, 0f) },
+                cmd("⬆", "Move up", true) { renderer.move(0f, 0.01f, 0f) },
+                cmd("⬇", "Move down", true) { renderer.move(0f, -0.01f, 0f) }
+            ))
+            addView(iconRow(
+                cmd("🔍", "Image Distance: nearer", true) { renderer.move(0f, 0f, 0.02f) },
+                cmd("🔭", "Image Distance: farther", true) { renderer.move(0f, 0f, -0.02f) }
+            ))
+        }
+
+        bubble = circleButton("⚙", 56).apply {
+            setOnClickListener {
+                val open = panel.visibility == View.VISIBLE
+                panel.visibility = if (open) View.GONE else View.VISIBLE
+                text = if (open) "⚙" else "✕"
+            }
+        }
 
         controls = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(topRow)
-            addView(status)
-            addView(spacer, LinearLayout.LayoutParams(1, 0, 1f))
-            addView(bottomRow)
+            addView(panel)
+            addView(bubble)
         }
-        root.addView(controls, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+        root.addView(
+            controls,
+            FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply {
+                    gravity = Gravity.BOTTOM or Gravity.START
+                    leftMargin = dp(12)
+                    bottomMargin = dp(12)
+                }
+        )
 
         exitOverlay = View(this).apply {
             visibility = View.GONE
@@ -127,26 +216,40 @@ class MainActivity : ComponentActivity() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-    private fun row(vararg buttons: Button): LinearLayout = LinearLayout(this).apply {
+    private fun iconRow(vararg buttons: Button): LinearLayout = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
-        for (b in buttons) {
-            addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        for (b in buttons) addView(b)
+    }
+
+    private fun circleButton(symbol: String, sizeDp: Int): Button = Button(this).apply {
+        text = symbol
+        textSize = 20f
+        setTextColor(Color.WHITE)
+        setAllCaps(false)
+        minWidth = 0
+        minimumWidth = 0
+        minHeight = 0
+        minimumHeight = 0
+        setPadding(0, 0, 0, 0)
+        background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0xCC202428.toInt())
+            setStroke(dp(1), 0x66FFFFFF)
+        }
+        layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp)).apply {
+            setMargins(dp(4), dp(4), dp(4), dp(4))
         }
     }
 
-    private fun bigButton(label: String, onClick: () -> Unit): Button = Button(this).apply {
-        text = label
-        setAllCaps(false)
-        textSize = 14f
-        minHeight = dp(52)
-        minimumHeight = dp(52)
-        alpha = 0.85f
-        setOnClickListener { onClick() }
+    private fun showHint(msg: String) {
+        status.text = msg
+        hintUntil = System.currentTimeMillis() + 1500
     }
 
-    private fun holdButton(label: String, action: () -> Unit): Button {
-        val b = bigButton(label) {}
-        val repeat = object : Runnable {
+    /** An icon command. If repeat is true it keeps acting while the finger is held down. */
+    private fun cmd(symbol: String, name: String, repeat: Boolean, action: () -> Unit): Button {
+        val b = circleButton(symbol, 52)
+        val rep = object : Runnable {
             override fun run() {
                 action()
                 handler.postDelayed(this, 70)
@@ -156,11 +259,12 @@ class MainActivity : ComponentActivity() {
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     v.isPressed = true
-                    handler.post(repeat)
+                    showHint(name)
+                    if (repeat) handler.post(rep) else action()
                 }
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                     v.isPressed = false
-                    handler.removeCallbacks(repeat)
+                    handler.removeCallbacks(rep)
                     persist()
                 }
             }
@@ -170,24 +274,37 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun persist() {
-        prefs.edit()
-            .putFloat("ox", renderer.offX)
-            .putFloat("oy", renderer.offY)
-            .putFloat("oz", renderer.offZ)
-            .putFloat("scale", renderer.scale)
-            .apply()
+        prefs.edit().putFloat("scale", renderer.scale).putFloat("alpha", renderer.alpha).apply()
     }
 
     private fun enterVr() {
         renderer.vrMode = true
         controls.visibility = View.GONE
+        status.visibility = View.GONE
         exitOverlay.visibility = View.VISIBLE
     }
 
     private fun exitVr() {
         renderer.vrMode = false
         controls.visibility = View.VISIBLE
+        status.visibility = View.VISIBLE
         exitOverlay.visibility = View.GONE
+    }
+
+    private fun registerTap() {
+        val now = System.currentTimeMillis()
+        if (now - lastTapTime > 700) tapCount = 0
+        lastTapTime = now
+        tapCount++
+        if (!renderer.uiLocked && tapCount >= 4) {
+            renderer.uiLocked = true
+            tapCount = 0
+            showHint("Buttons hidden. Tap 3 times quickly to bring them back.")
+        } else if (renderer.uiLocked && tapCount >= 3) {
+            renderer.uiLocked = false
+            tapCount = 0
+            showHint("Buttons are back.")
+        }
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -198,12 +315,20 @@ class MainActivity : ComponentActivity() {
                     return true
                 }
                 KeyEvent.KEYCODE_VOLUME_UP -> {
-                    renderer.requestPlace()
+                    if (event == null || event.repeatCount == 0) renderer.setPress(true)
                     return true
                 }
             }
         }
         return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent?): Boolean {
+        if (renderer.vrMode && keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            renderer.setPress(false)
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
     }
 
     private fun setStatus(msg: String) {
@@ -214,7 +339,7 @@ class MainActivity : ComponentActivity() {
         Thread {
             try {
                 val bmp = decode(uri)
-                renderer.setImage(bmp, false)
+                renderer.setImage(bmp)
             } catch (e: Exception) {
                 setStatus("Could not load the image: " + e.message)
             }
@@ -271,8 +396,8 @@ class MainActivity : ComponentActivity() {
     private fun startAr() {
         if (session == null) {
             try {
-                val status = ArCoreApk.getInstance().requestInstall(this, userRequestedInstall)
-                if (status == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
+                val installStatus = ArCoreApk.getInstance().requestInstall(this, userRequestedInstall)
+                if (installStatus == ArCoreApk.InstallStatus.INSTALL_REQUESTED) {
                     userRequestedInstall = false
                     return
                 }
@@ -280,6 +405,8 @@ class MainActivity : ComponentActivity() {
                 val cfg = Config(s)
                 cfg.updateMode = Config.UpdateMode.LATEST_CAMERA_IMAGE
                 cfg.planeFindingMode = Config.PlaneFindingMode.DISABLED
+                cfg.instantPlacementMode = Config.InstantPlacementMode.DISABLED
+                cfg.depthMode = Config.DepthMode.DISABLED
                 s.configure(cfg)
                 session = s
             } catch (e: Exception) {
@@ -297,12 +424,9 @@ class MainActivity : ComponentActivity() {
         renderer.session = session
         glView.onResume()
 
-        if (!restoredImage) {
-            restoredImage = true
-            prefs.getString("uri", null)?.let {
-                renderer.requestPlace()
-                loadImage(Uri.parse(it))
-            }
+        if (!askedForImage) {
+            askedForImage = true
+            pickImage.launch(arrayOf("image/*"))
         }
         handler.removeCallbacks(statusUpdater)
         handler.post(statusUpdater)
@@ -310,10 +434,14 @@ class MainActivity : ComponentActivity() {
 
     private val statusUpdater = object : Runnable {
         override fun run() {
-            status.text = when {
-                !renderer.hasImage -> "Tap Choose Image"
-                !renderer.tracking -> "Move the phone slowly so it can see the room..."
-                else -> "Tracking OK"
+            if (System.currentTimeMillis() > hintUntil) {
+                status.text = when {
+                    !renderer.hasImage -> "Open the menu ⚙ and choose an image"
+                    !renderer.tracking -> "Tracking lost. Step back and move the phone slowly."
+                    !renderer.placed -> "Look where you want the image, then tap 📍"
+                    renderer.uiLocked -> "Buttons hidden. Tap 3 times quickly to show them."
+                    else -> "Aim the dot at a button, then touch and hold the screen"
+                }
             }
             handler.postDelayed(this, 500)
         }
